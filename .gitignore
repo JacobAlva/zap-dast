@@ -1,0 +1,14 @@
+# Secrets / generated — never commit
+bearer*.txt
+.plan-*.yaml
+.zap-home/
+reports/
+zap.log
+__pycache__/
+# personal notes — keep local, not for the public repo
+zap.md
+WHY-IT-WORKS.md
+# archived diagnostics + old scripts (some hold plaintext creds) — never commit
+# your filled-in per-app config (copy of target.env.example)
+target.env
+bin/

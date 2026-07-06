@@ -1,0 +1,50 @@
+# ZAP stable + a PINNED Chrome-for-Testing browser, used by BOTH the AJAX spider
+# and the token mint (fetch_token.py). We pin because Debian's unpinned `chromium`
+# drifted to 150, which SIGTRAPs (exit 133) on launch inside a container — it fails
+# on native-Linux Docker regardless of RAM, headless mode, seccomp, or flags. CfT
+# 149.0.7827.155 is the last version verified working. Build once; reuse in CI.
+#
+#   docker build -f Dockerfile.zap-chrome -t zap-dast:chrome .
+#
+# To move off 149 later, bump CFT_VERSION to another Chrome-for-Testing build:
+#   https://googlechromelabs.github.io/chrome-for-testing/
+#
+FROM ghcr.io/zaproxy/zaproxy:stable
+USER root
+
+# Pinned Chrome-for-Testing version — chrome + its exactly-matching chromedriver.
+ARG CFT_VERSION=149.0.7827.155
+ARG CFT_BASE=https://storage.googleapis.com/chrome-for-testing-public
+
+# 1. Chrome's shared-library dependency closure. Installing Debian's `chromium` is
+#    the reliable way to pull exactly the right libs; we then point every browser
+#    path at pinned CfT below, so the (broken) apt chromium binary is never run.
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends chromium wget unzip ca-certificates \
+ && rm -rf /var/lib/apt/lists/*
+
+# 2. Selenium so the SAME image can also mint the Bearer token (fetch_token.py).
+#    Use `python3 -m pip` so it installs for the exact python3 fetch_token.py runs
+#    with (the image's pip3 targets a different interpreter).
+RUN python3 -m pip install --no-cache-dir --break-system-packages selenium
+
+# 3. Install pinned Chrome-for-Testing + its matching chromedriver into /opt, and
+#    put the driver on the path where ZAP expects it (selenium.chromeDriver).
+RUN cd /tmp \
+ && wget -q "${CFT_BASE}/${CFT_VERSION}/linux64/chrome-linux64.zip" \
+ && wget -q "${CFT_BASE}/${CFT_VERSION}/linux64/chromedriver-linux64.zip" \
+ && unzip -q chrome-linux64.zip -d /opt \
+ && unzip -q chromedriver-linux64.zip -d /opt \
+ && rm -f chrome-linux64.zip chromedriver-linux64.zip \
+ && cp -f /opt/chromedriver-linux64/chromedriver /usr/bin/chromedriver \
+ && chmod +x /usr/bin/chromedriver /opt/chrome-linux64/chrome /opt/chrome-linux64/chrome_crashpad_handler
+
+# 4. Expose "google-chrome" AND override "chromium" so that whichever name ZAP or
+#    chromedriver resolves, it launches the pinned CfT build with the flags a
+#    container needs (non-root, tiny /dev/shm, no GPU).
+RUN printf '#!/bin/sh\nexec /opt/chrome-linux64/chrome --no-sandbox --disable-dev-shm-usage --disable-gpu "$@"\n' > /usr/bin/google-chrome \
+ && chmod +x /usr/bin/google-chrome \
+ && cp -f /usr/bin/google-chrome /usr/bin/chromium
+ENV CHROME_BIN=/usr/bin/google-chrome
+ENV CHROMEDRIVER=/usr/bin/chromedriver
+USER zap

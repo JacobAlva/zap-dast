@@ -1,0 +1,97 @@
+---
+# ZAP Automation Framework — authenticated DAST (Docker / Linux / CI).
+# The ${VAR} placeholders below are filled in from target.env by run-docker.sh
+# (host-side, before this plan runs); only ${ZAP_AUTH_USER}/${ZAP_AUTH_PASS} are
+# left for ZAP to substitute. run-docker.sh also mints the token and injects it
+# via a Replacer rule. Browser: chrome-headless (needs the zap-dast:chrome image).
+env:
+  contexts:
+    - name: "${CONTEXT_NAME}"
+      urls:
+        - "${APP_URL}"
+        - "${API_URL}"
+      includePaths:
+        - "${API_URL}.*"
+        - "${APP_URL}.*"
+      authentication:
+        method: "browser"
+        parameters:
+          loginPageUrl: "${LOGIN_URL}"
+          loginPageWait: 20          # give the SPA time to store the token after login
+          stepDelay: 1               # 1s between login steps — steadier on slow IdPs
+          browserId: "chrome-headless"
+          steps:
+            - { description: "Click the login button on the landing page", type: CLICK, xpath: "${BTN_XPATH}", timeout: 10000 }
+            - { description: "Wait for the email/identifier screen", type: WAIT, timeout: 8000 }
+            - { description: "Enter email", type: USERNAME, cssSelector: "${USER_SEL}", timeout: 10000 }
+            - { description: "Submit identifier", type: RETURN, cssSelector: "${USER_SEL}" }
+            - { description: "Wait for the password screen", type: WAIT, timeout: 8000 }
+            - { description: "Enter password", type: PASSWORD, cssSelector: "${PASS_SEL}", timeout: 10000 }
+            - { description: "Submit password", type: RETURN, cssSelector: "${PASS_SEL}" }
+        verification:
+          # Poll a protected endpoint. The Replacer injects the token, so this returns
+          # 200 -> ZAP sees "logged in" and does NOT loop the browser login (autodetect
+          # verification can't recognise a localStorage-token session).
+          method: "poll"
+          pollUrl: "${VERIFY_URL}"
+          pollFrequency: 60
+          pollUnits: "requests"
+          loggedInRegex: "${LOGGEDIN_REGEX}"
+          loggedOutRegex: "\\Qaccess_denied\\E"
+      sessionManagement:
+        method: "headers"
+      users:
+        - name: "scanuser"
+          credentials:
+            username: "${ZAP_AUTH_USER}"
+            password: "${ZAP_AUTH_PASS}"
+  parameters:
+    failOnError: false
+    failOnWarning: false
+    progressToStdout: true
+
+jobs:
+  # Disable the "Session Management Response Identified" passive rule (id 10112):
+  # an auth-helper identifier (not a vuln check) with a known 100% CPU bug
+  # (zaproxy/zaproxy#7957) that chokes on the headless browser's background traffic.
+  - type: passiveScan-config
+    rules:
+      - id: 10112
+        threshold: "off"
+
+  - type: spiderAjax
+    parameters:
+      context: "${CONTEXT_NAME}"
+      user: "scanuser"
+      url: "${START_URL}"
+      browserId: "chrome-headless"
+      maxDuration: 1
+      maxCrawlDepth: 3
+
+  - type: passiveScan-wait
+
+  - type: activeScan
+    parameters:
+      context: "${CONTEXT_NAME}"
+      user: "scanuser"
+      policy: "Default Policy"
+      maxRuleDurationInMins: 1
+      maxScanDurationInMins: 1
+
+  - type: report
+    parameters:
+      template: "traditional-html"
+      reportDir: "/zap/wrk/reports"
+      reportFile: "${REPORT_NAME}.html"
+      reportTitle: "${CONTEXT_NAME} DAST"
+
+  # Machine-readable for CI (fail-on-threshold, run-to-run diffing, dashboards).
+  - type: report
+    parameters:
+      template: "traditional-json"
+      reportDir: "/zap/wrk/reports"
+      reportFile: "${REPORT_NAME}.json"
+      reportTitle: "${CONTEXT_NAME} DAST"
+
+  # Heavy request/response detail for manual triage — only added when
+  # ZAP_DETAILED=1 (run-docker.sh appends it at runtime). Off by default.
