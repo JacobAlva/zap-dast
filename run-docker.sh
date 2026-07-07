@@ -198,7 +198,7 @@ done
 #    spider crawls 0 URLs (flaky browser-auth login), then FAIL LOUDLY if still empty.
 LOG="$HERE/reports/scan-$TS.log"
 run_scan() {   # one attempt; tees ZAP output to $LOG; sets global rc
-  local logpid
+  local logpid ascan_start=0 next_beat=0 now el
   CURRENT_CID=$(docker run -d --shm-size=2g -v "$HERE":/zap/wrk:rw \
     -e ZAP_AUTH_USER -e ZAP_AUTH_PASS "${ENVARGS[@]}" \
     "$IMAGE" zap.sh -cmd -autorun "/zap/wrk/${WORKPLAN}" \
@@ -224,6 +224,20 @@ run_scan() {   # one attempt; tees ZAP output to $LOG; sets global rc
       # Did Docker's cgroup OOM-kill it? Definitive, unlike guessing from dmesg.
       oom_killed=$(docker inspect -f '{{.State.OOMKilled}}' "$CURRENT_CID" 2>/dev/null || echo "")
       break
+    fi
+    # Heartbeat during the (otherwise silent) active-scan phase — ZAP emits no live
+    # progress to stdout, so show elapsed time so the run doesn't look hung.
+    if grep -q "Job activeScan started" "$LOG" 2>/dev/null \
+       && ! grep -q "Job activeScan finished" "$LOG" 2>/dev/null; then
+      now=$(date +%s)
+      if [ "$ascan_start" = 0 ]; then
+        ascan_start=$now; next_beat=$((now + 60))
+        echo "   active scan running — ZAP attacks each URL; no per-step output. Heartbeat every 60s:"
+      elif [ "$now" -ge "$next_beat" ]; then
+        el=$(( now - ascan_start ))
+        printf "   ...still scanning — %dm%02ds into the active scan\n" "$((el/60))" "$((el%60))"
+        next_beat=$(( now + 60 ))
+      fi
     fi
     sleep 5
   done
