@@ -73,10 +73,14 @@ export ZAP_AUTH_PASS="<password>"
 ./run-docker.sh                                       # full authenticated scan (~35–40 min)
 ZAP_PLAN=zap-dast-quick.yaml ./run-docker.sh   # ~4-min smoke test
 ZAP_DETAILED=1 ./run-docker.sh                        # + heavy request/response HTML report
-ZAP_LOWMEM=1 ./run-docker.sh                          # fit a full scan on a ~4–6 GB Docker host
+ZAP_LOWMEM=0 ./run-docker.sh                          # force low-memory mode OFF (it auto-enables)
 ```
+**Low-memory mode is automatic** — if Docker has < 7 GiB the script prints `Low memory detected …
+switching to low-memory mode` and caps ZAP's heap + single-threads the active scan so it still
+completes (just slower). Force it with `ZAP_LOWMEM=1`/`0`.
+
 Env vars: `ZAP_AUTH_USER`, `ZAP_AUTH_PASS` (required); `ZAP_PLAN`, `ZAP_IMAGE`, `ZAP_DETAILED`,
-`ZAP_LOWMEM` (+ `ZAP_XMX`, MB), `ZAP_SKIP_MEM_CHECK` (optional).
+`ZAP_LOWMEM` (auto; `1`/`0` to force), `ZAP_XMX` (MB), `ZAP_SKIP_MEM_CHECK` (optional).
 `bearer.txt` is reused while it has > 45 min of validity left, otherwise re-minted automatically.
 
 ## Outputs (in `reports/`, all timestamped `-<TS>`)
@@ -147,5 +151,6 @@ The memory that matters is what the **container** sees (`docker info --format '{
 wants **≥ 8 GB**. Two fixes:
 - **Give Docker more memory** — WSL: `~/.wslconfig` `memory=16GB` then `wsl --shutdown`;
   Docker Desktop: Settings → Resources → Memory; a plain VM: raise its RAM.
-- **Or shrink ZAP's footprint** to fit ~4–6 GB: `ZAP_LOWMEM=1 ./run-docker.sh` (caps the JVM heap
-  via `ZAP_XMX`, default 1024 MB, and runs the active scan single-threaded).
+- **Or let it shrink itself** — below 7 GiB the script **auto-switches to low-memory mode** (caps
+  the JVM heap via `ZAP_XMX`, default 1024 MB, and single-threads the active scan). Force with
+  `ZAP_LOWMEM=1`/`0`. Below ~4 GiB even the browser step may not fit, so add memory there.

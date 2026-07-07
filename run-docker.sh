@@ -25,16 +25,13 @@ HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 IMAGE="${ZAP_IMAGE:-zap-dast:chrome}"
 PLAN="${ZAP_PLAN:-zap-dast.yaml}"          # override for a quick/custom plan
 
-# Low-memory mode for constrained hosts (~4-6 GB): cap ZAP's heap (zap.sh honors a
-# -Xmx passed as an argument, line ~120 of zap.sh) and run the active scan
-# single-threaded, so a full scan fits instead of being OOM-killed (exit 137).
-# Opt in with ZAP_LOWMEM=1; tune the heap with ZAP_XMX (MB, default 1024).
+# Low-memory mode is decided after the Docker daemon check below (once we can read
+# the engine's RAM). It caps ZAP's heap (zap.sh honors a -Xmx passed as an argument,
+# line ~120 of zap.sh) and single-threads the active scan, so a full scan fits on a
+# constrained host instead of being OOM-killed (exit 137). It AUTO-enables when Docker
+# has < LOWMEM_THRESHOLD_MIB; force it with ZAP_LOWMEM=1/0. Heap via ZAP_XMX (MB).
+LOWMEM_THRESHOLD_MIB="${LOWMEM_THRESHOLD_MIB:-7000}"
 LOWMEM_ARGS=()
-if [ -n "${ZAP_LOWMEM:-}" ]; then
-  : "${ZAP_XMX:=1024}"
-  LOWMEM_ARGS=(-Xmx"${ZAP_XMX}"m -config "scanner.threadPerHost=1")
-  echo "==> ZAP_LOWMEM: heap capped at ${ZAP_XMX}m, active scan single-threaded."
-fi
 
 # App-specific config (target.env). Auto-exported so both the plan (AF ${VAR}
 # substitution) and fetch_token.py pick the values up. Per-target values are
@@ -81,20 +78,33 @@ if ! timeout 15 docker info >/dev/null 2>&1; then
 fi
 echo "  OK (Docker only)"
 
-# Pre-flight: warn if the Docker engine has too little RAM. Headless Chrome (token
-# mint + AJAX spider) and ZAP's JVM otherwise get OOM-killed mid-run and surface as
-# a cryptic "Chrome instance exited" or Java OutOfMemoryError. Warn only, don't block.
-if [ -z "${ZAP_SKIP_MEM_CHECK:-}" ]; then
-  mem_bytes=$(docker info --format '{{.MemTotal}}' 2>/dev/null || echo 0)
-  mem_mib=$(( mem_bytes / 1024 / 1024 ))
-  if [ "$mem_bytes" -gt 0 ] && [ "$mem_mib" -lt 7000 ]; then
-    echo "  NOTE: Docker can use only ~${mem_mib} MiB (on a VM/Docker Desktop this is the"
-    echo "        VM's allocation, NOT the host's RAM). A full active scan wants >= 8 GiB;"
-    echo "        on less it can be OOM-killed (exit 137). Options: raise Docker's memory"
-    echo "        (WSL ~/.wslconfig 'memory='; Docker Desktop Settings > Resources), run with"
-    echo "        ZAP_LOWMEM=1 to shrink ZAP's footprint, or ZAP_PLAN=zap-dast-quick.yaml."
-    echo "        (Set ZAP_SKIP_MEM_CHECK=1 to silence.)"
+# Pre-flight memory: read the RAM the Docker engine can actually use (on a VM /
+# Docker Desktop this is the VM allocation, not the host's RAM), then auto-pick
+# low-memory mode so a full scan fits instead of getting OOM-killed (exit 137).
+mem_bytes=$(docker info --format '{{.MemTotal}}' 2>/dev/null || echo 0)
+mem_mib=$(( mem_bytes / 1024 / 1024 ))
+lowmem=0; lowmem_auto=0
+case "${ZAP_LOWMEM:-auto}" in
+  0|off|false|no) lowmem=0 ;;                                  # forced off
+  auto|"") { [ "$mem_bytes" -gt 0 ] && [ "$mem_mib" -lt "$LOWMEM_THRESHOLD_MIB" ]; } \
+             && { lowmem=1; lowmem_auto=1; } ;;                # auto-detect
+  *) lowmem=1 ;;                                               # forced on
+esac
+if [ "$lowmem" = 1 ]; then
+  : "${ZAP_XMX:=1024}"
+  LOWMEM_ARGS=(-Xmx"${ZAP_XMX}"m -config "scanner.threadPerHost=1")
+  if [ "$lowmem_auto" = 1 ]; then
+    echo "  Low memory detected (~${mem_mib} MiB available to Docker) — switching to"
+    echo "  low-memory mode (heap ${ZAP_XMX}m, single-threaded active scan). The scan will"
+    echo "  still run; it may just take a little longer. (ZAP_LOWMEM=0 to force it off.)"
+  else
+    echo "  ZAP_LOWMEM: heap capped at ${ZAP_XMX}m, active scan single-threaded."
   fi
+fi
+# Below ~4 GiB, even low-memory mode may not save the headless-Chrome step.
+if [ -z "${ZAP_SKIP_MEM_CHECK:-}" ] && [ "$mem_bytes" -gt 0 ] && [ "$mem_mib" -lt 3600 ]; then
+  echo "  WARNING: only ~${mem_mib} MiB for Docker — below ~4 GiB the browser step itself"
+  echo "           can be OOM-killed. Consider raising Docker/VM memory. (ZAP_SKIP_MEM_CHECK=1 to silence.)"
 fi
 
 # 0. Build the Chrome-enabled image if it isn't present yet (one-time, cached).
