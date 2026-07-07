@@ -73,8 +73,10 @@ export ZAP_AUTH_PASS="<password>"
 ./run-docker.sh                                       # full authenticated scan (~35–40 min)
 ZAP_PLAN=zap-dast-quick.yaml ./run-docker.sh   # ~4-min smoke test
 ZAP_DETAILED=1 ./run-docker.sh                        # + heavy request/response HTML report
+ZAP_LOWMEM=1 ./run-docker.sh                          # fit a full scan on a ~4–6 GB Docker host
 ```
-Env vars: `ZAP_AUTH_USER`, `ZAP_AUTH_PASS` (required); `ZAP_PLAN`, `ZAP_IMAGE`, `ZAP_DETAILED` (optional).
+Env vars: `ZAP_AUTH_USER`, `ZAP_AUTH_PASS` (required); `ZAP_PLAN`, `ZAP_IMAGE`, `ZAP_DETAILED`,
+`ZAP_LOWMEM` (+ `ZAP_XMX`, MB), `ZAP_SKIP_MEM_CHECK` (optional).
 `bearer.txt` is reused while it has > 45 min of validity left, otherwise re-minted automatically.
 
 ## Outputs (in `reports/`, all timestamped `-<TS>`)
@@ -138,6 +140,12 @@ docker build -f Dockerfile.zap-chrome -t zap-dast:chrome .
 docker run --rm zap-dast:chrome sh -c 'chromium --version; chromedriver --version'
 ```
 
-**Mint fails / scan dies on a small box.** Headless Chrome + ZAP's JVM need memory; on < ~4 GB
-they get OOM-killed (often surfacing as the same "Chrome instance exited"). `run-docker.sh`
-prints a RAM warning at start — give the Docker VM ≥ 4 GB (≥ 8 GB recommended).
+**Scan ends with code 137 (or the mint/scan dies on a small box).** `137 = SIGKILL` — ZAP was
+OOM-killed, usually mid active-scan. The script now prints `OOMKilled=true/false` to confirm.
+The memory that matters is what the **container** sees (`docker info --format '{{.MemTotal}}'`),
+**not** the host's RAM: on a VM or Docker Desktop that's the VM's allocation. A full active scan
+wants **≥ 8 GB**. Two fixes:
+- **Give Docker more memory** — WSL: `~/.wslconfig` `memory=16GB` then `wsl --shutdown`;
+  Docker Desktop: Settings → Resources → Memory; a plain VM: raise its RAM.
+- **Or shrink ZAP's footprint** to fit ~4–6 GB: `ZAP_LOWMEM=1 ./run-docker.sh` (caps the JVM heap
+  via `ZAP_XMX`, default 1024 MB, and runs the active scan single-threaded).

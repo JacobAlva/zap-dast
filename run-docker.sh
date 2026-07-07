@@ -25,6 +25,17 @@ HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 IMAGE="${ZAP_IMAGE:-zap-dast:chrome}"
 PLAN="${ZAP_PLAN:-zap-dast.yaml}"          # override for a quick/custom plan
 
+# Low-memory mode for constrained hosts (~4-6 GB): cap ZAP's heap (zap.sh honors a
+# -Xmx passed as an argument, line ~120 of zap.sh) and run the active scan
+# single-threaded, so a full scan fits instead of being OOM-killed (exit 137).
+# Opt in with ZAP_LOWMEM=1; tune the heap with ZAP_XMX (MB, default 1024).
+LOWMEM_ARGS=()
+if [ -n "${ZAP_LOWMEM:-}" ]; then
+  : "${ZAP_XMX:=1024}"
+  LOWMEM_ARGS=(-Xmx"${ZAP_XMX}"m -config "scanner.threadPerHost=1")
+  echo "==> ZAP_LOWMEM: heap capped at ${ZAP_XMX}m, active scan single-threaded."
+fi
+
 # App-specific config (target.env). Auto-exported so both the plan (AF ${VAR}
 # substitution) and fetch_token.py pick the values up. Per-target values are
 # required (below); only common-pattern selectors have generic fallbacks.
@@ -76,12 +87,13 @@ echo "  OK (Docker only)"
 if [ -z "${ZAP_SKIP_MEM_CHECK:-}" ]; then
   mem_bytes=$(docker info --format '{{.MemTotal}}' 2>/dev/null || echo 0)
   mem_mib=$(( mem_bytes / 1024 / 1024 ))
-  if [ "$mem_bytes" -gt 0 ] && [ "$mem_mib" -lt 3600 ]; then
-    echo "  WARNING: Docker has only ~${mem_mib} MiB RAM available to containers."
-    echo "           This tool needs >= 4 GiB (>= 8 GiB recommended); on less, headless"
-    echo "           Chrome and ZAP's JVM will likely be OOM-killed ('Chrome instance"
-    echo "           exited' / Java OutOfMemoryError). Increase your VM/Docker memory."
-    echo "           (Set ZAP_SKIP_MEM_CHECK=1 to silence this check.)"
+  if [ "$mem_bytes" -gt 0 ] && [ "$mem_mib" -lt 7000 ]; then
+    echo "  NOTE: Docker can use only ~${mem_mib} MiB (on a VM/Docker Desktop this is the"
+    echo "        VM's allocation, NOT the host's RAM). A full active scan wants >= 8 GiB;"
+    echo "        on less it can be OOM-killed (exit 137). Options: raise Docker's memory"
+    echo "        (WSL ~/.wslconfig 'memory='; Docker Desktop Settings > Resources), run with"
+    echo "        ZAP_LOWMEM=1 to shrink ZAP's footprint, or ZAP_PLAN=zap-dast-quick.yaml."
+    echo "        (Set ZAP_SKIP_MEM_CHECK=1 to silence.)"
   fi
 fi
 
@@ -161,6 +173,7 @@ run_scan() {   # one attempt; tees ZAP output to $LOG; sets global rc
   cid=$(docker run -d --shm-size=2g -v "$HERE":/zap/wrk:rw \
     -e ZAP_AUTH_USER -e ZAP_AUTH_PASS "${ENVARGS[@]}" \
     "$IMAGE" zap.sh -cmd -autorun "/zap/wrk/${WORKPLAN}" \
+    "${LOWMEM_ARGS[@]}" \
     -config "selenium.chromeDriver=/usr/bin/chromedriver" \
     -config "replacer.full_list(0).description=dast-bearer" \
     -config "replacer.full_list(0).enabled=true" \
@@ -171,14 +184,17 @@ run_scan() {   # one attempt; tees ZAP output to $LOG; sets global rc
     -config "replacer.full_list(0).initiators=")
   docker logs -f "$cid" 2>&1 | tee "$LOG" &
   logpid=$!
-  rc=1
+  rc=1; oom_killed=""
   while :; do
     if grep -qE "Automation plan (succeeded|failed)" "$LOG" 2>/dev/null; then
       grep -q "Automation plan succeeded" "$LOG" && rc=0 || rc=2
       sleep 3; docker stop -t 15 "$cid" >/dev/null 2>&1; break   # sidestep the shutdown hang
     fi
     if [ "$(docker inspect -f '{{.State.Running}}' "$cid" 2>/dev/null)" != "true" ]; then
-      rc=$(docker inspect -f '{{.State.ExitCode}}' "$cid" 2>/dev/null || echo 1); break
+      rc=$(docker inspect -f '{{.State.ExitCode}}' "$cid" 2>/dev/null || echo 1)
+      # Did Docker's cgroup OOM-kill it? Definitive, unlike guessing from dmesg.
+      oom_killed=$(docker inspect -f '{{.State.OOMKilled}}' "$cid" 2>/dev/null || echo "")
+      break
     fi
     sleep 5
   done
@@ -235,6 +251,12 @@ case "$rc" in
   3) echo "==> FAILED: the spider crawled 0 URLs even after a retry — the authenticated"
      echo "    login didn't take. Check ZAP_AUTH_USER/PASS, the selectors/URLs in"
      echo "    target.env, and that the target is reachable." ;;
+  137) echo "==> FAILED (137 = SIGKILL). OOMKilled=${oom_killed:-unknown}."
+     echo "    ZAP ran out of memory (usually mid active-scan). Docker here can use only"
+     echo "    $(docker info --format '{{.MemTotal}}' 2>/dev/null | awk '{printf "%.1f", $1/1073741824}') GiB — on a VM/Docker Desktop that's the VM's allocation, NOT the host's"
+     echo "    RAM. Give Docker more memory (WSL -> ~/.wslconfig 'memory='; Docker Desktop"
+     echo "    -> Settings > Resources; a plain VM -> raise its RAM), OR fit the scan into"
+     echo "    what you have by re-running with ZAP_LOWMEM=1. See README Troubleshooting." ;;
   *) echo "==> Scan ended abnormally (code $rc) — see the console log." ;;
 esac
 echo "-----------------------------------------"
