@@ -20,6 +20,25 @@ set -euo pipefail
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 : "${ZAP_AUTH_USER:?set ZAP_AUTH_USER}"
 : "${ZAP_AUTH_PASS:?set ZAP_AUTH_PASS}"
+
+# Clean up on exit/interrupt: the scan runs with `docker run -d`, so the container
+# is owned by the Docker daemon, not this script — without this, Ctrl-C would kill
+# the script but leave the container scanning in the background. This stops it and
+# drops the temp plan. CURRENT_CID is set while a scan container is live, cleared
+# after a normal finish so the trap doesn't double-stop.
+CURRENT_CID=""
+cleanup() {
+  trap - INT TERM EXIT                       # disarm so cleanup runs exactly once
+  if [ -n "$CURRENT_CID" ]; then
+    echo; echo "==> Cleaning up: stopping scan container ${CURRENT_CID:0:12}..."
+    docker stop -t 5 "$CURRENT_CID" >/dev/null 2>&1
+    docker rm -f "$CURRENT_CID" >/dev/null 2>&1
+  fi
+  [ -n "${WORKPLAN:-}" ] && rm -f "$HERE/$WORKPLAN" 2>/dev/null
+  return 0
+}
+trap cleanup EXIT
+trap 'cleanup; exit 130' INT TERM
 # Derived ZAP image with Chromium (the base image ships Firefox only, whose
 # spider can't crawl the authenticated SPA). Built from Dockerfile.zap-chrome.
 IMAGE="${ZAP_IMAGE:-zap-dast:chrome}"
@@ -179,8 +198,8 @@ done
 #    spider crawls 0 URLs (flaky browser-auth login), then FAIL LOUDLY if still empty.
 LOG="$HERE/reports/scan-$TS.log"
 run_scan() {   # one attempt; tees ZAP output to $LOG; sets global rc
-  local cid logpid
-  cid=$(docker run -d --shm-size=2g -v "$HERE":/zap/wrk:rw \
+  local logpid
+  CURRENT_CID=$(docker run -d --shm-size=2g -v "$HERE":/zap/wrk:rw \
     -e ZAP_AUTH_USER -e ZAP_AUTH_PASS "${ENVARGS[@]}" \
     "$IMAGE" zap.sh -cmd -autorun "/zap/wrk/${WORKPLAN}" \
     "${LOWMEM_ARGS[@]}" \
@@ -192,24 +211,25 @@ run_scan() {   # one attempt; tees ZAP output to $LOG; sets global rc
     -config "replacer.full_list(0).regex=false" \
     -config "replacer.full_list(0).replacement=${AUTH_PREFIX}${TOK}" \
     -config "replacer.full_list(0).initiators=")
-  docker logs -f "$cid" 2>&1 | tee "$LOG" &
+  docker logs -f "$CURRENT_CID" 2>&1 | tee "$LOG" &
   logpid=$!
   rc=1; oom_killed=""
   while :; do
     if grep -qE "Automation plan (succeeded|failed)" "$LOG" 2>/dev/null; then
       grep -q "Automation plan succeeded" "$LOG" && rc=0 || rc=2
-      sleep 3; docker stop -t 15 "$cid" >/dev/null 2>&1; break   # sidestep the shutdown hang
+      sleep 3; docker stop -t 15 "$CURRENT_CID" >/dev/null 2>&1; break   # sidestep the shutdown hang
     fi
-    if [ "$(docker inspect -f '{{.State.Running}}' "$cid" 2>/dev/null)" != "true" ]; then
-      rc=$(docker inspect -f '{{.State.ExitCode}}' "$cid" 2>/dev/null || echo 1)
+    if [ "$(docker inspect -f '{{.State.Running}}' "$CURRENT_CID" 2>/dev/null)" != "true" ]; then
+      rc=$(docker inspect -f '{{.State.ExitCode}}' "$CURRENT_CID" 2>/dev/null || echo 1)
       # Did Docker's cgroup OOM-kill it? Definitive, unlike guessing from dmesg.
-      oom_killed=$(docker inspect -f '{{.State.OOMKilled}}' "$cid" 2>/dev/null || echo "")
+      oom_killed=$(docker inspect -f '{{.State.OOMKilled}}' "$CURRENT_CID" 2>/dev/null || echo "")
       break
     fi
     sleep 5
   done
   kill "$logpid" 2>/dev/null
-  docker rm -f "$cid" >/dev/null 2>&1
+  docker rm -f "$CURRENT_CID" >/dev/null 2>&1
+  CURRENT_CID=""   # normal finish — disarm the cleanup trap's container stop
 }
 spider_urls() { grep -oE "found [0-9]+ URLs" "$LOG" 2>/dev/null | grep -oE "[0-9]+" | tail -1; }
 
