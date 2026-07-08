@@ -49,6 +49,7 @@ flowchart LR
 | `zap-dast-quick.yaml` | Short plan (1-min spider + 1-min active scan) for smoke tests |
 | `Dockerfile.zap-chrome` | ZAP stable + Chromium + Selenium (used for both the spider and the token mint) |
 | `fetch_token.py` | Headless browser login → outputs the Bearer token |
+| `discover.py` | Optional setup helper: records a manual login and drafts `target.env` for you |
 | `reports/` | Timestamped outputs |
 | `bin/` | Archived diagnostics + the old native (non-Docker) scripts |
 
@@ -64,6 +65,18 @@ browser DevTools — ~10 min, one-time):
 cp target.env.example target.env
 # then edit target.env: APP_URL, API_URL, login URL + selectors, token key, verify endpoint, …
 ```
+
+### Or bootstrap it with `discover.py` (optional)
+Instead of hunting through DevTools, let a helper record a real login and draft the config. Runs
+on your **host** (a visible browser opens — not headless/Docker); the only dependency is Selenium:
+```bash
+pip install selenium
+python discover.py https://your-app.example.com/landing   # the page with the Log In button
+```
+Log in normally in the window that opens, press Enter, and it writes **`target.env.discovered`**
+(it never touches your real `target.env`). It auto-detects the login selectors, token key, API
+origin + auth header, and a candidate verify endpoint — review the `# TODO` lines for anything it
+couldn't nail, then `cp target.env.discovered target.env`.
 
 ## Usage
 ```bash

@@ -11,4 +11,5 @@ WHY-IT-WORKS.md
 # archived diagnostics + old scripts (some hold plaintext creds) — never commit
 # your filled-in per-app config (copy of target.env.example)
 target.env
+target.env.discovered
 bin/
