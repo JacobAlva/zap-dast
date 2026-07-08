@@ -73,10 +73,11 @@ on your **host** (a visible browser opens — not headless/Docker); the only dep
 pip install selenium
 python discover.py https://your-app.example.com/landing   # the page with the Log In button
 ```
-Log in normally in the window that opens, press Enter, and it writes **`target.env.discovered`**
-(it never touches your real `target.env`). It auto-detects the login selectors, token key, API
-origin + auth header, and a candidate verify endpoint — review the `# TODO` lines for anything it
-couldn't nail, then `cp target.env.discovered target.env`.
+Log in normally in the window that opens, press Enter, and it **prints a draft `target.env`** to
+the console (it never touches your real `target.env`). It auto-detects the login selectors, token
+key, API origin + auth header, and a candidate verify endpoint — review the `# TODO` lines for
+anything it couldn't nail, then paste what you want into `target.env`. The draft goes to stdout and
+messages to stderr, so `python discover.py <url> > target.env.discovered` saves a clean file.
 
 ## Usage
 ```bash

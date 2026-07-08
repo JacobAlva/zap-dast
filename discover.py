@@ -9,8 +9,9 @@ records what it needs so you don't have to dig through DevTools:
   - the API origin + auth header from real requests -> API_URL / AUTH_HEADER / AUTH_PREFIX
   - a candidate authenticated endpoint + a stable field in its body -> VERIFY_URL / LOGGEDIN_REGEX
 
-It then writes a draft **target.env.discovered** (it never touches your real target.env).
-Everything is a best guess — skim it, fix the TODO lines, then `cp target.env.discovered target.env`.
+It then PRINTS a draft target.env to the console (it never touches your real target.env).
+Everything is a best guess — skim it, fix the TODO lines, and paste what you want into target.env.
+The draft goes to stdout and all messages to stderr, so `> target.env.discovered` gives a clean file.
 
 Run on your HOST (needs a desktop + Chrome) — NOT headless / in Docker:
 
@@ -22,8 +23,6 @@ argv[1] is the page with the "Log In" button (your LOGIN_URL).
 import json
 import re
 import sys
-import time
-from pathlib import Path
 from urllib.parse import urlparse
 
 try:
@@ -32,8 +31,6 @@ try:
 except ImportError:
     sys.exit("ERROR: Selenium is required on the host — run: pip install selenium")
 
-HERE = Path(__file__).resolve().parent
-OUT = HERE / "target.env.discovered"
 JWT_RE = re.compile(r"eyJ[A-Za-z0-9_-]{5,}\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+")
 
 # Injected into every document (incl. the IdP page) via CDP, so it survives the
@@ -135,9 +132,10 @@ def main():
     driver = make_driver()
     try:
         driver.get(login_url)
-        print("\n=== A browser window opened. Log in normally there. ===")
-        print("When you're fully logged in (you can see your app's authenticated page),")
-        input("come back here and press Enter to capture the config... ")
+        print("\n=== A browser window opened. Log in normally there. ===", file=sys.stderr)
+        print("When you're fully logged in (you can see your app's authenticated page),", file=sys.stderr)
+        print("come back here and press Enter to capture the config... ", end="", file=sys.stderr, flush=True)
+        input()
 
         start_url = driver.current_url
         app_origin = origin(start_url) or origin(login_url)
@@ -254,13 +252,15 @@ def write_output(login_url, app_origin, start_url, user_sel, pass_sel, btn_xpath
         f'CONTEXT_NAME="{ctx}"',
         "",
     ]
-    OUT.write_text("\n".join(lines) + "\n", encoding="utf-8")
-
     found = sum(x is not None and x != "" for x in
                 [app_origin, api_url, start_url, btn_xpath, user_sel, pass_sel,
                  token_key, auth_header, auth_prefix, verify_url, logged_in_regex])
-    print(f"\n==> Wrote {OUT}  ({found}/11 values auto-detected)")
-    print("    Review the TODO lines, then:  cp target.env.discovered target.env")
+    # Draft -> stdout (so `> target.env.discovered` is clean); summary -> stderr.
+    print(f"\n==> Draft target.env ({found}/11 values auto-detected) — review the TODO lines:\n",
+          file=sys.stderr)
+    print("\n".join(lines))
+    print(f"\n==> {found}/11 auto-detected. Paste what you want into target.env "
+          "(or re-run with '> target.env.discovered' to save).", file=sys.stderr)
 
 
 if __name__ == "__main__":
