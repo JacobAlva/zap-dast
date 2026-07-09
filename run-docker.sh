@@ -252,6 +252,12 @@ if [ -n "${ZAP_ASCAN_MINS:-}" ]; then
     echo "==> Active-scan time cap set to ${ZAP_ASCAN_MINS} min."
   fi
 fi
+# Optional: override the PER-RULE time cap (safety net against a single stuck rule).
+# ZAP_RULE_MINS=0 removes it too — only do that if you also accept an unbounded total.
+if [ -n "${ZAP_RULE_MINS:-}" ]; then
+  sed -i "s|maxRuleDurationInMins: [0-9]*|maxRuleDurationInMins: ${ZAP_RULE_MINS}|" "$HERE/$WORKPLAN"
+  echo "==> Per-rule time cap set to ${ZAP_RULE_MINS} min$([ "$ZAP_RULE_MINS" = 0 ] && echo ' (UNLIMITED — a stuck rule can run forever)')."
+fi
 
 # 4. Run the scan. The container runs DETACHED (ZAP -cmd can hang on shutdown, so
 #    we stop it ourselves once the plan is done). Robustness: retry once if the
