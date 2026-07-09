@@ -66,6 +66,14 @@ cp target.env.example target.env
 # then edit target.env: APP_URL, API_URL, login URL + selectors, token key, verify endpoint, …
 ```
 
+### API coverage — set `OPENAPI_URL` (strongly recommended)
+For an app with a JSON/REST API, the **single most important** setting is `OPENAPI_URL` (an
+optional line in `target.env`). Without it, the active scan only attacks the API calls your UI
+happens to trigger — so you get a mostly *passive* report even after a full 30-minute scan. With
+it, ZAP imports **every** endpoint + parameter from your OpenAPI/Swagger spec and actively attacks
+the whole API. Point it at your spec (e.g. `OPENAPI_URL="${API_URL}/swagger/v1/swagger.json"`); the
+scan's `target.env` reports `API spec import: yes` in the summary so you can confirm it took.
+
 ### Or bootstrap it with `discover.py` (optional)
 Instead of hunting through DevTools, let a helper record a real login and draft the config. Runs
 on your **host** (a visible browser opens — not headless/Docker); the only dependency is Selenium:
@@ -100,7 +108,7 @@ Env vars: `ZAP_AUTH_USER`, `ZAP_AUTH_PASS` (required); `ZAP_PLAN`, `ZAP_IMAGE`, 
 ## Outputs (in `reports/`, all timestamped `-<TS>`)
 | Artifact | Contents |
 |----------|----------|
-| `scan-summary-<TS>.txt` | URLs discovered, spider/active-scan timings, **alert counts by risk**, token expiry |
+| `scan-summary-<TS>.txt` | **scan profile** (full/quick + caps), **API-spec import** status, URLs discovered, spider/active-scan timings (flags if the active scan hit its time cap), **alert counts by risk**, token expiry |
 | `<context>-zap-report-<TS>.html` | Human-readable findings |
 | `<context>-zap-report-<TS>.json` | Machine-readable (CI thresholds / run-to-run diffing) |
 | `scan-<TS>.log` | Full ZAP console output |

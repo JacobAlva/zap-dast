@@ -193,6 +193,22 @@ for v in APP_URL API_URL LOGIN_URL START_URL VERIFY_URL LOGGEDIN_REGEX \
   sed -i "s|\${$v}|$val|g" "$HERE/$WORKPLAN"
 done
 
+# Optional: import an OpenAPI/Swagger spec (OPENAPI_URL in target.env) so the active
+# scan attacks the FULL API surface, not just the calls the SPA happened to make.
+# Injected as the first job; targetUrl is API_URL (specs often omit a servers block).
+if [ -n "${OPENAPI_URL:-}" ]; then
+  OPENAPI_JOB="  - type: openapi
+    parameters:
+      apiUrl: \"${OPENAPI_URL}\"
+      targetUrl: \"${API_URL}\"
+      context: \"${CONTEXT_NAME}\""
+  awk -v job="$OPENAPI_JOB" '
+    /^[[:space:]]*-[[:space:]]*type:[[:space:]]*spiderAjax/ && !ins { print job; ins=1 }
+    { print }
+  ' "$HERE/$WORKPLAN" > "$HERE/$WORKPLAN.tmp" && mv "$HERE/$WORKPLAN.tmp" "$HERE/$WORKPLAN"
+  echo "==> OpenAPI import enabled ($OPENAPI_URL) — active scan will cover the full API."
+fi
+
 # 4. Run the scan. The container runs DETACHED (ZAP -cmd can hang on shutdown, so
 #    we stop it ourselves once the plan is done). Robustness: retry once if the
 #    spider crawls 0 URLs (flaky browser-auth login), then FAIL LOUDLY if still empty.
@@ -273,15 +289,32 @@ urls=$(grep -oE "found [0-9]+ URLs" "$LOG" | grep -oE "[0-9]+" | tail -1)
 spider_t=$(grep "spiderAjax finished" "$LOG" | grep -oE "[0-9:]{8}" | tail -1)
 ascan_t=$(grep "activeScan finished" "$LOG" | grep -oE "[0-9:]{8}" | tail -1)
 result=$(grep -oE "Automation plan (succeeded|failed)" "$LOG" | tail -1)
+# --- scan-reach visibility: profile, caps, API import, cap-hit ---------------
+case "$PLAN" in *quick*) profile="quick (smoke test)";; *) profile="full";; esac
+ascan_cap=$(grep -oE "maxScanDurationInMins = [0-9]+" "$LOG" | grep -oE "[0-9]+" | tail -1)
+spider_cap=$(grep -oE "spiderAjax set maxDuration = [0-9]+" "$LOG" | grep -oE "[0-9]+" | tail -1)
+ascan_note=""
+if [ -n "$ascan_t" ] && [ -n "$ascan_cap" ]; then
+  amin=$(printf '%s' "$ascan_t" | awk -F: '{print ($1*60)+$2}')   # HH:MM:SS -> minutes
+  [ "${amin:-0}" -ge "$ascan_cap" ] && ascan_note="  [hit the ${ascan_cap}m cap — surface likely exceeds the time budget]"
+fi
+if [ -n "${OPENAPI_URL:-}" ]; then
+  api_ops=$(grep -oiE "imported [0-9]+ (url|endpoint|operation|path|message)" "$LOG" | grep -oE "[0-9]+" | tail -1)
+  api_line="yes — ${OPENAPI_URL}${api_ops:+  (~${api_ops} ops imported)}"
+else
+  api_line="no  (set OPENAPI_URL in target.env to attack the full API surface)"
+fi
 exp_epoch=$(jwt_exp "$HERE/bearer.txt" 2>/dev/null)
 tok_exp=$( { [ -n "$exp_epoch" ] && { date -u -d "@$exp_epoch" +"%Y-%m-%d %H:%M UTC" 2>/dev/null || date -u -r "$exp_epoch" +"%Y-%m-%d %H:%M UTC" 2>/dev/null; }; } || echo "unknown" )
 risk() { [ -f "$JSON" ] || { echo 0; return; }; { grep -oE "\"riskcode\"[[:space:]]*:[[:space:]]*\"$1\"" "$JSON" || true; } | wc -l | tr -d ' '; }
 {
   echo "$CONTEXT_NAME DAST — $TS"
+  echo "  Scan profile    : ${profile}${ascan_cap:+  (spider ${spider_cap:-?}m / active-scan cap ${ascan_cap}m)}"
   echo "  Target          : $APP_URL + $API_URL"
-  echo "  URLs discovered : ${urls:-?}"
+  echo "  API spec import : ${api_line}"
+  echo "  URLs discovered : ${urls:-?}  (AJAX spider)"
   echo "  Spider time     : ${spider_t:-?}"
-  echo "  Active scan time: ${ascan_t:-?}"
+  echo "  Active scan time: ${ascan_t:-?}${ascan_note}"
   echo "  Result          : ${result:-unknown}"
   echo "  Alerts          : High=$(risk 3)  Medium=$(risk 2)  Low=$(risk 1)  Info=$(risk 0)"
   echo "  Token expires   : ${tok_exp}"
