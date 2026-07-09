@@ -299,8 +299,12 @@ if [ -n "$ascan_t" ] && [ -n "$ascan_cap" ]; then
   [ "${amin:-0}" -ge "$ascan_cap" ] && ascan_note="  [hit the ${ascan_cap}m cap — surface likely exceeds the time budget]"
 fi
 if [ -n "${OPENAPI_URL:-}" ]; then
-  api_ops=$(grep -oiE "imported [0-9]+ (url|endpoint|operation|path|message)" "$LOG" | grep -oE "[0-9]+" | tail -1)
-  api_line="yes — ${OPENAPI_URL}${api_ops:+  (~${api_ops} ops imported)}"
+  if grep -qi "Job openapi" "$LOG" 2>/dev/null; then
+    api_ops=$(grep -oiE "imported [0-9]+ (url|endpoint|operation|path|message)" "$LOG" | grep -oE "[0-9]+" | tail -1)
+    api_line="yes — ${OPENAPI_URL}${api_ops:+  (~${api_ops} ops imported)}"
+  else
+    api_line="CONFIGURED but the openapi job did not run — check the log (spec fetch/parse failed?)"
+  fi
 else
   api_line="no  (set OPENAPI_URL in target.env to attack the full API surface)"
 fi
