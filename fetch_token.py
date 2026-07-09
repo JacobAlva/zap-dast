@@ -20,6 +20,7 @@ Exit:   0 on success (token written), 1 on failure.
 import base64
 import json
 import os
+import re
 import sys
 import time
 from pathlib import Path
@@ -59,6 +60,33 @@ def jwt_exp(token: str) -> str:
         return time.strftime("%Y-%m-%d %H:%M:%S UTC", time.gmtime(data["exp"]))
     except Exception:
         return "unknown"
+
+
+# Phrases IdP login pages show for bad credentials / unknown accounts. Used to turn
+# a raw Selenium timeout into a clear "wrong username/password" message.
+AUTH_ERR_RE = re.compile(
+    r"wrong email or password|wrong username or password|incorrect (email|username|password)"
+    r"|invalid (email|username|password|credentials|login)|your (username|password) is incorrect"
+    r"|couldn'?t find (your|an) account|no account (found|matching|with)|user( ?name)? (not found|does ?n'?t exist)"
+    r"|that .{0,20}doesn'?t match|check your (credentials|password|(email|username) and password)"
+    r"|access denied|login failed",
+    re.I,
+)
+
+
+def page_error(driver):
+    """Return the login page's error line if it's showing a credential error, else None."""
+    try:
+        txt = driver.execute_script("return document.body ? document.body.innerText : '';") or ""
+    except Exception:
+        return None
+    if not AUTH_ERR_RE.search(txt):
+        return None
+    for line in txt.splitlines():
+        line = line.strip()
+        if line and AUTH_ERR_RE.search(line):
+            return line[:160]
+    return "the login page reported an authentication error"
 
 
 def main() -> int:
@@ -117,6 +145,12 @@ def main() -> int:
                 break
             time.sleep(0.5)
         if not token:
+            err = page_error(driver)   # wrong password lands here (field appeared, login rejected)
+            if err:
+                print("==> Login failed: the app rejected the credentials — "
+                      "check ZAP_AUTH_USER / ZAP_AUTH_PASS.", file=sys.stderr)
+                print(f'    (login page said: "{err}")', file=sys.stderr)
+                return 2
             print("ERROR: id_token never appeared in localStorage", file=sys.stderr)
             print("final url:", driver.current_url, file=sys.stderr)
             return 1
@@ -134,10 +168,17 @@ def main() -> int:
             print(f"    token expires: {jwt_exp(token)}")
         return 0
     except Exception as e:
-        # Login step failed (usually a timeout waiting for a field). Dump what the
-        # browser is actually showing so we can see the screen it got stuck on —
-        # wrong creds, a CAPTCHA / "verify it's you" / MFA interstitial, a changed
-        # selector, etc. (Creds are never printed.)
+        # Login step failed (usually a timeout waiting for a field). If the page is
+        # showing a credential error (wrong username lands here — the password field
+        # never appears), say so plainly. Otherwise dump what the browser is showing
+        # so we can see the screen it stalled on (CAPTCHA / verify / MFA / changed
+        # selector). Creds are never printed.
+        err = page_error(driver)
+        if err:
+            print("==> Login failed: the app rejected the credentials — "
+                  "check ZAP_AUTH_USER / ZAP_AUTH_PASS.", file=sys.stderr)
+            print(f'    (login page said: "{err}")', file=sys.stderr)
+            return 2
         first = (str(e).splitlines() or [""])[0]
         print(f"ERROR during login: {type(e).__name__}: {first}", file=sys.stderr)
         try:
