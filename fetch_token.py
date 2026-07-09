@@ -133,6 +133,27 @@ def main() -> int:
             print(f"OK: wrote {len(token)}-char id_token to {TOKEN_OUT}")
             print(f"    token expires: {jwt_exp(token)}")
         return 0
+    except Exception as e:
+        # Login step failed (usually a timeout waiting for a field). Dump what the
+        # browser is actually showing so we can see the screen it got stuck on —
+        # wrong creds, a CAPTCHA / "verify it's you" / MFA interstitial, a changed
+        # selector, etc. (Creds are never printed.)
+        first = (str(e).splitlines() or [""])[0]
+        print(f"ERROR during login: {type(e).__name__}: {first}", file=sys.stderr)
+        try:
+            print(f"  final URL : {driver.current_url}", file=sys.stderr)
+            print(f"  page title: {driver.title}", file=sys.stderr)
+            inputs = driver.execute_script(
+                "return JSON.stringify(Array.from(document.querySelectorAll('input'))"
+                ".map(function(i){return {type:i.type,id:i.id,name:i.name};}));")
+            print(f"  inputs on page: {inputs}", file=sys.stderr)
+            txt = driver.execute_script(
+                "return document.body ? document.body.innerText.slice(0,600) : '';")
+            print("  visible text (first 600 chars):", file=sys.stderr)
+            print(txt, file=sys.stderr)
+        except Exception:
+            pass
+        return 1
     finally:
         driver.quit()
 
