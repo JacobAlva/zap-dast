@@ -102,7 +102,14 @@ switching to low-memory mode` and caps ZAP's heap + single-threads the active sc
 completes (just slower). Force it with `ZAP_LOWMEM=1`/`0`.
 
 Env vars: `ZAP_AUTH_USER`, `ZAP_AUTH_PASS` (required); `ZAP_PLAN`, `ZAP_IMAGE`, `ZAP_DETAILED`,
-`ZAP_LOWMEM` (auto; `1`/`0` to force), `ZAP_XMX` (MB), `ZAP_SKIP_MEM_CHECK` (optional).
+`ZAP_LOWMEM` (auto; `1`/`0` to force), `ZAP_XMX` (MB), `ZAP_ASCAN_MINS`, `ZAP_SKIP_MEM_CHECK` (optional).
+
+**Active-scan time budget:** the plan caps the active scan (30 min full / 1 min quick) for
+predictability. Override it with `ZAP_ASCAN_MINS` — e.g. `ZAP_ASCAN_MINS=180` for 3 hours, or
+**`ZAP_ASCAN_MINS=0` to remove the cap and run to completion** (can take hours on a large API; must
+finish within the token's ~24 h lifetime). The per-rule cap stays either way, so one stuck rule
+can't hang the whole scan. If the summary shows `[hit the …m cap]`, coverage was incomplete —
+raise this. With `OPENAPI_URL` set, the spec is validated **before** the scan so a bad URL is caught up front.
 `bearer.txt` is reused while it has > 45 min of validity left, otherwise re-minted automatically.
 
 ## Outputs (in `reports/`, all timestamped `-<TS>`)

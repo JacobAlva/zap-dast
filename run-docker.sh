@@ -168,6 +168,37 @@ if [ "$NEED_FETCH" = 1 ]; then
 fi
 TOK="$(tr -d '\r\n' < "$HERE/bearer.txt")"
 
+# 2b. If an OpenAPI spec is configured, validate it NOW (before the long scan) so a
+#     bad URL / unreachable / non-JSON spec is caught up front, not discovered at the
+#     end. The scan still proceeds either way; we just warn loudly about the impact.
+if [ -n "${OPENAPI_URL:-}" ]; then
+  echo "==> Validating OpenAPI spec: $OPENAPI_URL"
+  set +e
+  oa_chk=$(docker run --rm -e OA_URL="$OPENAPI_URL" -e OA_HK="$AUTH_HEADER" -e OA_HV="${AUTH_PREFIX}${TOK}" \
+    "$IMAGE" python3 -c '
+import os, urllib.request, json, sys
+req = urllib.request.Request(os.environ["OA_URL"])
+req.add_header(os.environ["OA_HK"], os.environ["OA_HV"])
+try:
+    body = urllib.request.urlopen(req, timeout=20).read()
+    j = json.loads(body)
+    print("OK", len(j.get("paths", {})))
+except Exception as e:
+    print("ERR", repr(e)[:150]); sys.exit(1)
+' 2>&1)
+  set -e
+  if printf '%s' "$oa_chk" | grep -q "^OK"; then
+    echo "    OK — $(printf '%s' "$oa_chk" | awk '{print $2}') API paths found; the active scan will attack the full API."
+  else
+    echo "    !! WARNING: could NOT fetch/parse the OpenAPI spec:"
+    echo "       $oa_chk"
+    echo "       The scan will STILL run, but the active scan will only cover the API"
+    echo "       calls the UI happens to trigger — NOT the full API. Fix OPENAPI_URL"
+    echo "       (or unset it) for correct coverage. Continuing in 5s..."
+    sleep 5
+  fi
+fi
+
 # 3. Build the effective plan; append the heavy detail report only if ZAP_DETAILED=1.
 TS="$(date +%Y%m%d-%H%M%S)"          # one timestamp shared by every artifact
 mkdir -p "$HERE/reports"
@@ -207,6 +238,19 @@ if [ -n "${OPENAPI_URL:-}" ]; then
     { print }
   ' "$HERE/$WORKPLAN" > "$HERE/$WORKPLAN.tmp" && mv "$HERE/$WORKPLAN.tmp" "$HERE/$WORKPLAN"
   echo "==> OpenAPI import enabled ($OPENAPI_URL) — active scan will cover the full API."
+fi
+
+# Optional: override the active-scan TIME budget. ZAP_ASCAN_MINS=0 removes the cap
+# entirely (runs to completion); e.g. ZAP_ASCAN_MINS=180 for 3 hours. Unset = the
+# plan's default (30 full / 1 quick). The per-rule cap (maxRuleDurationInMins) stays,
+# so a single stuck rule can't hang the whole scan even when the total is unlimited.
+if [ -n "${ZAP_ASCAN_MINS:-}" ]; then
+  sed -i "s|maxScanDurationInMins: [0-9]*|maxScanDurationInMins: ${ZAP_ASCAN_MINS}|" "$HERE/$WORKPLAN"
+  if [ "$ZAP_ASCAN_MINS" = 0 ]; then
+    echo "==> Active-scan time cap REMOVED (runs to completion; may take hours on a large API)."
+  else
+    echo "==> Active-scan time cap set to ${ZAP_ASCAN_MINS} min."
+  fi
 fi
 
 # 4. Run the scan. The container runs DETACHED (ZAP -cmd can hang on shutdown, so
@@ -294,10 +338,11 @@ case "$PLAN" in *quick*) profile="quick (smoke test)";; *) profile="full";; esac
 ascan_cap=$(grep -oE "maxScanDurationInMins = [0-9]+" "$LOG" | grep -oE "[0-9]+" | tail -1)
 spider_cap=$(grep -oE "spiderAjax set maxDuration = [0-9]+" "$LOG" | grep -oE "[0-9]+" | tail -1)
 ascan_note=""
-if [ -n "$ascan_t" ] && [ -n "$ascan_cap" ]; then
+if [ -n "$ascan_t" ] && [ -n "$ascan_cap" ] && [ "$ascan_cap" != 0 ]; then
   amin=$(printf '%s' "$ascan_t" | awk -F: '{print ($1*60)+$2}')   # HH:MM:SS -> minutes
-  [ "${amin:-0}" -ge "$ascan_cap" ] && ascan_note="  [hit the ${ascan_cap}m cap — surface likely exceeds the time budget]"
+  [ "${amin:-0}" -ge "$ascan_cap" ] && ascan_note="  [hit the ${ascan_cap}m cap — surface likely exceeds the time budget; raise ZAP_ASCAN_MINS]"
 fi
+cap_disp=$([ "${ascan_cap:-}" = 0 ] && echo "unlimited" || echo "${ascan_cap:-?}m")
 if [ -n "${OPENAPI_URL:-}" ]; then
   if grep -qi "Job openapi" "$LOG" 2>/dev/null; then
     api_ops=$(grep -oiE "imported [0-9]+ (url|endpoint|operation|path|message)" "$LOG" | grep -oE "[0-9]+" | tail -1)
@@ -313,7 +358,7 @@ tok_exp=$( { [ -n "$exp_epoch" ] && { date -u -d "@$exp_epoch" +"%Y-%m-%d %H:%M 
 risk() { [ -f "$JSON" ] || { echo 0; return; }; { grep -oE "\"riskcode\"[[:space:]]*:[[:space:]]*\"$1\"" "$JSON" || true; } | wc -l | tr -d ' '; }
 {
   echo "$CONTEXT_NAME DAST — $TS"
-  echo "  Scan profile    : ${profile}${ascan_cap:+  (spider ${spider_cap:-?}m / active-scan cap ${ascan_cap}m)}"
+  echo "  Scan profile    : ${profile}${ascan_cap:+  (spider ${spider_cap:-?}m / active-scan cap ${cap_disp})}"
   echo "  Target          : $APP_URL + $API_URL"
   echo "  API spec import : ${api_line}"
   echo "  URLs discovered : ${urls:-?}  (AJAX spider)"
