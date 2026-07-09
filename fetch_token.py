@@ -65,28 +65,115 @@ def jwt_exp(token: str) -> str:
 # Phrases IdP login pages show for bad credentials / unknown accounts. Used to turn
 # a raw Selenium timeout into a clear "wrong username/password" message.
 AUTH_ERR_RE = re.compile(
-    r"wrong email or password|wrong username or password|incorrect (email|username|password)"
-    r"|invalid (email|username|password|credentials|login)|your (username|password) is incorrect"
-    r"|couldn'?t find (your|an) account|no account (found|matching|with)|user( ?name)? (not found|does ?n'?t exist)"
-    r"|that .{0,20}doesn'?t match|check your (credentials|password|(email|username) and password)"
-    r"|access denied|login failed",
+    # "... email / username / password / credentials ... (are|is) incorrect|invalid|wrong ..."
+    # (catches Auth0's "Your email or password are incorrect.")
+    r"(e-?mail|user\s?name|password|credential)s?.{0,30}?(?:are|is|was|were)?\s*"
+    r"(?:incorrect|invalid|wrong|not recognized|do(?:es)?n'?t match)"
+    # reverse order: "incorrect / invalid / wrong / unrecognized email|username|password"
+    r"|(?:incorrect|invalid|wrong|unrecognized)\s+(?:e-?mail|user\s?name|password|credential)"
+    r"|couldn'?t find (?:your|an) account|no account (?:found|matching|with)"
+    r"|user\s?name (?:not found|does ?n'?t exist)"
+    r"|access denied|login failed|too many (?:failed )?attempts|account (?:is )?(?:locked|blocked)",
     re.I,
 )
 
 
 def page_error(driver):
-    """Return the login page's error line if it's showing a credential error, else None."""
+    """Return the login page's credential-error message (verbatim) if present.
+
+    Checks dedicated alert/error elements first (Auth0 uses a
+    <span id="error-element-password">), then falls back to a body-text line scan."""
     try:
-        txt = driver.execute_script("return document.body ? document.body.innerText : '';") or ""
+        texts = driver.execute_script(
+            "return Array.from(document.querySelectorAll("
+            "'[role=alert],[id*=error],[class*=error],.error'))"
+            ".map(function(e){return (e.innerText||'').trim();})"
+            ".filter(function(t){return t.length > 1;});") or []
     except Exception:
-        return None
-    if not AUTH_ERR_RE.search(txt):
-        return None
-    for line in txt.splitlines():
+        texts = []
+    for t in texts:
+        if AUTH_ERR_RE.search(t):
+            return " ".join(t.split())[:200]
+    try:
+        body = driver.execute_script("return document.body ? document.body.innerText : '';") or ""
+    except Exception:
+        body = ""
+    for line in body.splitlines():
         line = line.strip()
         if line and AUTH_ERR_RE.search(line):
-            return line[:160]
-    return "the login page reported an authentication error"
+            return " ".join(line.split())[:200]
+    return None
+
+
+def debug_dump(driver):
+    """With ZAP_DEBUG_LOGIN=1, dump the failing page's error elements + body text so
+    the login-error detection can be tuned to the real IdP markup."""
+    if not os.environ.get("ZAP_DEBUG_LOGIN"):
+        return
+    print("---- ZAP_DEBUG_LOGIN dump ----", file=sys.stderr)
+    try:
+        print("URL:", driver.current_url, file=sys.stderr)
+        alerts = driver.execute_script(
+            "return Array.from(document.querySelectorAll("
+            "'[role=alert],[aria-live],[class*=error],[id*=error],.error'))"
+            ".map(function(e){return e.tagName+' id='+e.id+' class='+e.className"
+            "+' :: '+((e.innerText||'').trim());});")
+        print("ALERT/ERROR ELEMENTS:", file=sys.stderr)
+        for a in (alerts or ["(none found)"]):
+            print("   ", a, file=sys.stderr)
+        body = driver.execute_script("return document.body ? document.body.innerText : '';") or ""
+        print("BODY INNERTEXT (first 1200 chars):", file=sys.stderr)
+        print(body[:1200], file=sys.stderr)
+    except Exception as ex:
+        print("   dump error:", ex, file=sys.stderr)
+    print("---- end dump ----", file=sys.stderr)
+
+
+def login_error_present(driver):
+    """True if a visible, non-empty error/alert element is on the page. A structural
+    signal (no wording assumptions) used to fail fast when the IdP rejects a login."""
+    try:
+        return bool(driver.execute_script(
+            "return Array.from(document.querySelectorAll("
+            "'[role=alert],[id*=error],[class*=error],.error'))"
+            ".some(function(e){var t=(e.innerText||'').trim();if(t.length<2)return false;"
+            "var r=e.getBoundingClientRect();return r.width>0&&r.height>0;});"))
+    except Exception:
+        return False
+
+
+def wait_field_or_error(driver, css_sel, timeout=30):
+    """Return the field element once visible, or None if a login error shows first
+    (fail fast) or we time out — so a bad username/password doesn't wait out 30s."""
+    end = time.time() + timeout
+    while time.time() < end:
+        try:
+            els = driver.find_elements(By.CSS_SELECTOR, css_sel)
+            if els and els[0].is_displayed():
+                return els[0]
+        except Exception:
+            pass
+        if login_error_present(driver):
+            return None
+        time.sleep(0.4)
+    return None
+
+
+def fail_login(driver):
+    """Report a credential failure clearly (+ the page's own error line when readable)
+    and dump page state under ZAP_DEBUG_LOGIN=1. Returns exit code 2."""
+    err = page_error(driver)
+    print("==> Login failed — no auth token was issued.", file=sys.stderr)
+    if err:
+        print(f'    The login page says: "{err}"', file=sys.stderr)
+        print("    => wrong ZAP_AUTH_USER / ZAP_AUTH_PASS.", file=sys.stderr)
+    else:
+        print("    Most likely wrong ZAP_AUTH_USER / ZAP_AUTH_PASS. If those are correct,", file=sys.stderr)
+        print("    the login needs a step we can't automate (CAPTCHA / MFA / consent) —", file=sys.stderr)
+        print("    open the final URL below in a real browser to see what it wants.", file=sys.stderr)
+    print(f"    final URL: {driver.current_url}", file=sys.stderr)
+    debug_dump(driver)
+    return 2
 
 
 def main() -> int:
@@ -129,31 +216,34 @@ def main() -> int:
             EC.element_to_be_clickable((By.XPATH, BTN_XPATH))
         ).click()
 
-        # 2. Identifier screen: email -> submit
-        wait.until(EC.visibility_of_element_located((By.CSS_SELECTOR, USER_SEL))).send_keys(USER)
+        # 2. Identifier screen: email -> submit. Bail fast if the IdP shows an error.
+        user_field = wait_field_or_error(driver, USER_SEL)
+        if user_field is None:
+            return fail_login(driver)
+        user_field.send_keys(USER)
         driver.find_element(By.CSS_SELECTOR, "button[type=submit]").click()
 
-        # 3. Password screen: password -> submit
-        wait.until(EC.visibility_of_element_located((By.CSS_SELECTOR, PASS_SEL))).send_keys(PASS)
+        # 3. Password screen: password -> submit. A wrong USERNAME often stalls here
+        #    (password field never appears) or shows an error — either way, bail fast.
+        pass_field = wait_field_or_error(driver, PASS_SEL)
+        if pass_field is None:
+            return fail_login(driver)
+        pass_field.send_keys(PASS)
         driver.find_element(By.CSS_SELECTOR, "button[type=submit]").click()
 
-        # 4. Wait until the SPA has stored the token in localStorage
+        # 4. Wait until the SPA stores the token — but bail the moment the login page
+        #    shows an error (wrong PASSWORD), instead of sitting through the timeout.
         token = None
-        for _ in range(60):  # up to ~30s
+        deadline = time.time() + 30
+        while time.time() < deadline:
             token = driver.execute_script(f"return localStorage.getItem('{TOKEN_KEY}');")
             if token:
                 break
+            if login_error_present(driver):
+                break
             time.sleep(0.5)
         if not token:
-            err = page_error(driver)   # wrong password lands here (field appeared, login rejected)
-            if err:
-                print("==> Login failed: the app rejected the credentials — "
-                      "check ZAP_AUTH_USER / ZAP_AUTH_PASS.", file=sys.stderr)
-                print(f'    (login page said: "{err}")', file=sys.stderr)
-                return 2
-            print("ERROR: id_token never appeared in localStorage", file=sys.stderr)
-            print("final url:", driver.current_url, file=sys.stderr)
-            return 1
+            return fail_login(driver)
 
         # TOKEN_STDOUT=1 -> print ONLY the token to stdout (summary to stderr) so a
         # caller can capture it (e.g. `docker run ... > bearer.txt`) without the
@@ -168,29 +258,28 @@ def main() -> int:
             print(f"    token expires: {jwt_exp(token)}")
         return 0
     except Exception as e:
-        # Login step failed (usually a timeout waiting for a field). If the page is
-        # showing a credential error (wrong username lands here — the password field
-        # never appears), say so plainly. Otherwise dump what the browser is showing
-        # so we can see the screen it stalled on (CAPTCHA / verify / MFA / changed
-        # selector). Creds are never printed.
+        # A login step failed (usually a timeout waiting for a field). Wrong USERNAME
+        # lands here — the password screen never appears. If the page shows a credential
+        # error, say so; otherwise dump page state so we can see what it stalled on.
         err = page_error(driver)
         if err:
-            print("==> Login failed: the app rejected the credentials — "
-                  "check ZAP_AUTH_USER / ZAP_AUTH_PASS.", file=sys.stderr)
-            print(f'    (login page said: "{err}")', file=sys.stderr)
+            print("==> Login failed — the app rejected the credentials.", file=sys.stderr)
+            print(f'    The login page says: "{err}"  => check ZAP_AUTH_USER / ZAP_AUTH_PASS.', file=sys.stderr)
+            print(f"    final URL: {driver.current_url}", file=sys.stderr)
             return 2
-        first = (str(e).splitlines() or [""])[0]
-        print(f"ERROR during login: {type(e).__name__}: {first}", file=sys.stderr)
+        print(f"==> Login failed before it completed ({type(e).__name__}).", file=sys.stderr)
+        print("    If ZAP_AUTH_USER/PASS are correct, the page likely wants a CAPTCHA / MFA /", file=sys.stderr)
+        print("    consent step, or the target.env selectors don't match. Page state:", file=sys.stderr)
         try:
-            print(f"  final URL : {driver.current_url}", file=sys.stderr)
-            print(f"  page title: {driver.title}", file=sys.stderr)
+            print(f"    final URL : {driver.current_url}", file=sys.stderr)
+            print(f"    page title: {driver.title}", file=sys.stderr)
             inputs = driver.execute_script(
                 "return JSON.stringify(Array.from(document.querySelectorAll('input'))"
                 ".map(function(i){return {type:i.type,id:i.id,name:i.name};}));")
-            print(f"  inputs on page: {inputs}", file=sys.stderr)
+            print(f"    inputs on page: {inputs}", file=sys.stderr)
             txt = driver.execute_script(
                 "return document.body ? document.body.innerText.slice(0,600) : '';")
-            print("  visible text (first 600 chars):", file=sys.stderr)
+            print("    visible text (first 600 chars):", file=sys.stderr)
             print(txt, file=sys.stderr)
         except Exception:
             pass
