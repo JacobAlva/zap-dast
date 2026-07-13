@@ -102,8 +102,15 @@ switching to low-memory mode` and caps ZAP's heap + single-threads the active sc
 completes (just slower). Force it with `ZAP_LOWMEM=1`/`0`.
 
 Env vars: `ZAP_AUTH_USER`, `ZAP_AUTH_PASS` (required); `ZAP_PLAN`, `ZAP_IMAGE`, `ZAP_DETAILED`,
-`ZAP_LOWMEM` (auto; `1`/`0` to force), `ZAP_XMX` (MB), `ZAP_ASCAN_MINS`, `ZAP_RULE_MINS`, `ZAP_SKIP_MEM_CHECK` (optional).
-Any of these can also be set in `target.env` (it's sourced), which is handy for per-target defaults.
+`ZAP_LOWMEM` (auto; `1`/`0` to force), `ZAP_XMX` (MB), `ZAP_ASCAN_MINS`, `ZAP_RULE_MINS`, `ZAP_MAX_HOURS`, `ZAP_SKIP_MEM_CHECK` (optional).
+Any of these can also be set in `target.env` (it's sourced) for per-target defaults; a runtime value wins over `target.env`, which wins over the built-in default.
+
+**Interrupting / long scans.** The scan persists its ZAP session to `.zap-session/` as it runs,
+so its data survives a stop. **Ctrl-C** prompts you: `[r]` partial report (from what's scanned so
+far), `[s]` keep the raw session (open in ZAP Desktop / report later), `[q]` discard. The scan
+also **auto-stops and reports** ~5 min before the token expires (nothing useful happens after — the
+token dies and every request 401s), or sooner if you set `ZAP_MAX_HOURS`. A partial report is
+titled *PARTIAL* and written to `reports/` with the normal timestamped name.
 
 **Active-scan time budget:** the plan caps the active scan (30 min full / 1 min quick) for
 predictability. Override it with `ZAP_ASCAN_MINS` — e.g. `ZAP_ASCAN_MINS=180` for 3 hours, or

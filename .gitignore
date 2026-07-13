@@ -3,6 +3,8 @@ bearer*.txt
 .plan-*.yaml
 .zap-home/
 reports/
+.zap-session/
+.report-only-*.yaml
 zap.log
 __pycache__/
 # personal notes — keep local, not for the public repo

@@ -26,8 +26,8 @@ HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # the script but leave the container scanning in the background. This stops it and
 # drops the temp plan. CURRENT_CID is set while a scan container is live, cleared
 # after a normal finish so the trap doesn't double-stop.
-CURRENT_CID=""
-cleanup() {
+CURRENT_CID=""; SESSION_PATH=""; SESSION_CPATH=""
+cleanup() {   # normal exit / error: stop a still-running container, drop the temp plan
   trap - INT TERM EXIT                       # disarm so cleanup runs exactly once
   if [ -n "$CURRENT_CID" ]; then
     echo; echo "==> Cleaning up: stopping scan container ${CURRENT_CID:0:12}..."
@@ -37,8 +37,68 @@ cleanup() {
   [ -n "${WORKPLAN:-}" ] && rm -f "$HERE/$WORKPLAN" 2>/dev/null
   return 0
 }
+# Generate a report from the persisted (possibly partial) ZAP session. The scan runs
+# with -newsession into a host-mounted dir, so its data survives even a hard stop; we
+# load it and run a report-only plan (verified to work) into reports/.
+report_from_session() {
+  [ -f "${SESSION_PATH:-x}.session" ] || { echo "   (no saved session to report from)"; return 0; }
+  echo "==> Generating a report from the scanned-so-far session..."
+  local rop=".report-only-${TS}.yaml"
+  cat > "$HERE/$rop" <<YAML
+env:
+  contexts:
+    - name: "partial"
+      urls: [ "${APP_URL}" ]
+  parameters:
+    progressToStdout: true
+jobs:
+  - type: report
+    parameters:
+      template: traditional-html
+      reportDir: /zap/wrk/reports
+      reportFile: ${REPORT_NAME}-${TS}.html
+      reportTitle: "${CONTEXT_NAME} DAST — PARTIAL (interrupted)"
+  - type: report
+    parameters:
+      template: traditional-json
+      reportDir: /zap/wrk/reports
+      reportFile: ${REPORT_NAME}-${TS}.json
+YAML
+  docker run --rm -v "$HERE":/zap/wrk:rw "$IMAGE" \
+    zap.sh -cmd -session "$SESSION_CPATH" -autorun "/zap/wrk/$rop" >>"${LOG:-/dev/null}" 2>&1
+  rm -f "$HERE/$rop"
+  if [ -f "$HERE/reports/${REPORT_NAME}-${TS}.html" ]; then
+    echo "   Partial report: reports/${REPORT_NAME}-${TS}.html (+ .json)"
+  else
+    echo "   Report generation failed; the raw session is kept at ${SESSION_PATH}.session"
+  fi
+}
+# Ctrl-C / TERM: stop the scan (its session is already on disk) and let the user pick
+# what to keep. Non-interactive (no tty) defaults to generating the partial report.
+on_interrupt() {
+  trap - INT TERM EXIT
+  set +e                                     # never let cleanup abort the handler
+  echo; echo "==> Interrupted — stopping the scan (its session is saved)."
+  [ -n "$CURRENT_CID" ] && docker stop -t 10 "$CURRENT_CID" >/dev/null 2>&1
+  local ans="r"
+  if [ -f "${SESSION_PATH:-x}.session" ] && [ -r /dev/tty ]; then
+    echo "   [r] partial report from what's been scanned so far  (default)"
+    echo "   [s] keep the raw session only (open in ZAP Desktop / report later)"
+    echo "   [q] quit and discard"
+    printf "   choose [r/s/q]: "
+    read -r ans </dev/tty 2>/dev/null || ans="r"; ans="${ans:-r}"
+  fi
+  case "$ans" in
+    s|S) echo "   Session kept: ${SESSION_PATH}.session (open in ZAP Desktop, or re-run to report)." ;;
+    q|Q) echo "   Discarding session."; rm -f "${SESSION_PATH:-x}".session* 2>/dev/null ;;
+    *)   report_from_session ;;
+  esac
+  [ -n "$CURRENT_CID" ] && docker rm -f "$CURRENT_CID" >/dev/null 2>&1; CURRENT_CID=""
+  [ -n "${WORKPLAN:-}" ] && rm -f "$HERE/$WORKPLAN" 2>/dev/null
+  exit 130
+}
 trap cleanup EXIT
-trap 'cleanup; exit 130' INT TERM
+trap on_interrupt INT TERM
 # IMAGE/PLAN (and the other ZAP_* knobs) are resolved AFTER target.env is sourced
 # below, so they can be set in target.env too — while a runtime override still wins.
 
@@ -54,7 +114,7 @@ LOWMEM_ARGS=()
 # BEFORE sourcing the file, then re-apply after it — so a runtime override wins over
 # a value in target.env, which in turn beats the built-in default.
 #   precedence:  runtime env  >  target.env  >  default
-ZAP_KNOBS="ZAP_PLAN ZAP_IMAGE ZAP_DETAILED ZAP_LOWMEM ZAP_XMX ZAP_ASCAN_MINS ZAP_RULE_MINS ZAP_SKIP_MEM_CHECK OPENAPI_URL"
+ZAP_KNOBS="ZAP_PLAN ZAP_IMAGE ZAP_DETAILED ZAP_LOWMEM ZAP_XMX ZAP_ASCAN_MINS ZAP_RULE_MINS ZAP_MAX_HOURS ZAP_SKIP_MEM_CHECK OPENAPI_URL"
 for v in $ZAP_KNOBS; do printf -v "_RT_$v" '%s' "${!v:-}"; done
 
 # App-specific config (target.env). Auto-exported so both the plan (AF ${VAR}
@@ -272,11 +332,15 @@ fi
 #    we stop it ourselves once the plan is done). Robustness: retry once if the
 #    spider crawls 0 URLs (flaky browser-auth login), then FAIL LOUDLY if still empty.
 LOG="$HERE/reports/scan-$TS.log"
+# Persist ZAP's session to a host-mounted dir so an interrupted/auto-stopped scan
+# keeps its data (for a partial report or ZAP Desktop) instead of dying with the container.
+SESSION_PATH="$HERE/.zap-session/$TS"; SESSION_CPATH="/zap/wrk/.zap-session/$TS"
+mkdir -p "$HERE/.zap-session"
 run_scan() {   # one attempt; tees ZAP output to $LOG; sets global rc
-  local logpid ascan_start=0 next_beat=0 now el
+  local logpid ascan_start=0 next_beat=0 now el deadline _exp _dm
   CURRENT_CID=$(docker run -d --shm-size=2g -v "$HERE":/zap/wrk:rw \
     -e ZAP_AUTH_USER -e ZAP_AUTH_PASS "${ENVARGS[@]}" \
-    "$IMAGE" zap.sh -cmd -autorun "/zap/wrk/${WORKPLAN}" \
+    "$IMAGE" zap.sh -cmd -newsession "$SESSION_CPATH" -autorun "/zap/wrk/${WORKPLAN}" \
     "${LOWMEM_ARGS[@]}" \
     -config "selenium.chromeDriver=/usr/bin/chromedriver" \
     -config "replacer.full_list(0).description=dast-bearer" \
@@ -289,6 +353,14 @@ run_scan() {   # one attempt; tees ZAP output to $LOG; sets global rc
   docker logs -f "$CURRENT_CID" 2>&1 | tee "$LOG" &
   logpid=$!
   rc=1; oom_killed=""
+  # Auto-stop deadline: 5 min before the token expires (everything after is 401s), or
+  # ZAP_MAX_HOURS if sooner. Bounds runaway/unbounded scans automatically.
+  deadline=""
+  _exp=$(jwt_exp "$HERE/bearer.txt" 2>/dev/null); [ -n "$_exp" ] && deadline=$((_exp - 300))
+  if [ -n "${ZAP_MAX_HOURS:-}" ]; then
+    _dm=$(( $(date +%s) + ZAP_MAX_HOURS * 3600 ))
+    { [ -z "$deadline" ] || [ "$_dm" -lt "$deadline" ]; } && deadline="$_dm"
+  fi
   while :; do
     if grep -qE "Automation plan (succeeded|failed)" "$LOG" 2>/dev/null; then
       grep -q "Automation plan succeeded" "$LOG" && rc=0 || rc=2
@@ -299,6 +371,12 @@ run_scan() {   # one attempt; tees ZAP output to $LOG; sets global rc
       # Did Docker's cgroup OOM-kill it? Definitive, unlike guessing from dmesg.
       oom_killed=$(docker inspect -f '{{.State.OOMKilled}}' "$CURRENT_CID" 2>/dev/null || echo "")
       break
+    fi
+    if [ -n "$deadline" ] && [ "$(date +%s)" -ge "$deadline" ]; then
+      echo; echo "==> Reached the scan deadline (token nearing expiry / ZAP_MAX_HOURS) — stopping now;"
+      echo "    anything past the token's lifetime just gets 401s. Reporting partial results."
+      docker stop -t 15 "$CURRENT_CID" >/dev/null 2>&1
+      rc=4; break
     fi
     # Heartbeat during the (otherwise silent) active-scan phase — ZAP emits no live
     # progress to stdout, so show elapsed time so the run doesn't look hung.
@@ -333,7 +411,13 @@ if [ "$rc" = 0 ] && [ "$urls" = 0 ]; then
 fi
 # Fail loudly: a 'successful' plan that crawled nothing means auth didn't work.
 [ "$rc" = 0 ] && [ "$urls" = 0 ] && rc=3
+# Auto-stopped at the deadline: the plan never reached its report jobs, so build the
+# report from the saved session (writes the same timestamped names the summary reads).
+[ "$rc" = 4 ] && report_from_session
 rm -f "$HERE/$WORKPLAN"
+# On a clean run the plan already wrote the reports, so the session is redundant —
+# delete it to avoid disk bloat. Keep it on any non-clean rc (for diagnosis/partial report).
+[ "$rc" = 0 ] && rm -f "${SESSION_PATH}".session* 2>/dev/null
 
 # 5. Timestamp the artifacts (the plan writes fixed names) so runs never overwrite.
 for f in "$REPORT_NAME.html" "$REPORT_NAME.json" "$REPORT_NAME-plus.html"; do
@@ -392,6 +476,8 @@ case "$rc" in
   3) echo "==> FAILED: the spider crawled 0 URLs even after a retry — the authenticated"
      echo "    login didn't take. Check ZAP_AUTH_USER/PASS, the selectors/URLs in"
      echo "    target.env, and that the target is reachable." ;;
+  4) echo "==> Scan auto-stopped at the deadline (token expiry / ZAP_MAX_HOURS)."
+     echo "    The report above is PARTIAL — only what was scanned before the stop." ;;
   137) echo "==> FAILED (137 = SIGKILL). OOMKilled=${oom_killed:-unknown}."
      echo "    ZAP ran out of memory (usually mid active-scan). Docker here can use only"
      echo "    $(docker info --format '{{.MemTotal}}' 2>/dev/null | awk '{printf "%.1f", $1/1073741824}') GiB — on a VM/Docker Desktop that's the VM's allocation, NOT the host's"
