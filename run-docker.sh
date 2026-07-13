@@ -39,10 +39,8 @@ cleanup() {
 }
 trap cleanup EXIT
 trap 'cleanup; exit 130' INT TERM
-# Derived ZAP image with Chromium (the base image ships Firefox only, whose
-# spider can't crawl the authenticated SPA). Built from Dockerfile.zap-chrome.
-IMAGE="${ZAP_IMAGE:-zap-dast:chrome}"
-PLAN="${ZAP_PLAN:-zap-dast.yaml}"          # override for a quick/custom plan
+# IMAGE/PLAN (and the other ZAP_* knobs) are resolved AFTER target.env is sourced
+# below, so they can be set in target.env too — while a runtime override still wins.
 
 # Low-memory mode is decided after the Docker daemon check below (once we can read
 # the engine's RAM). It caps ZAP's heap (zap.sh honors a -Xmx passed as an argument,
@@ -52,11 +50,22 @@ PLAN="${ZAP_PLAN:-zap-dast.yaml}"          # override for a quick/custom plan
 LOWMEM_THRESHOLD_MIB="${LOWMEM_THRESHOLD_MIB:-7000}"
 LOWMEM_ARGS=()
 
+# Runtime env beats target.env: capture any knob set inline / in the parent env
+# BEFORE sourcing the file, then re-apply after it — so a runtime override wins over
+# a value in target.env, which in turn beats the built-in default.
+#   precedence:  runtime env  >  target.env  >  default
+ZAP_KNOBS="ZAP_PLAN ZAP_IMAGE ZAP_DETAILED ZAP_LOWMEM ZAP_XMX ZAP_ASCAN_MINS ZAP_RULE_MINS ZAP_SKIP_MEM_CHECK OPENAPI_URL"
+for v in $ZAP_KNOBS; do printf -v "_RT_$v" '%s' "${!v:-}"; done
+
 # App-specific config (target.env). Auto-exported so both the plan (AF ${VAR}
 # substitution) and fetch_token.py pick the values up. Per-target values are
 # required (below); only common-pattern selectors have generic fallbacks.
 CFG="${TARGET_ENV:-$HERE/target.env}"
 [ -f "$CFG" ] && { set -a; . "$CFG"; set +a; } || { echo "  MISSING $CFG — run: cp target.env.example target.env  (then fill it in)"; exit 1; }
+# Re-apply runtime overrides captured above (they win over target.env).
+for v in $ZAP_KNOBS; do rt="_RT_$v"; [ -n "${!rt}" ] && printf -v "$v" '%s' "${!rt}"; done
+IMAGE="${ZAP_IMAGE:-zap-dast:chrome}"
+PLAN="${ZAP_PLAN:-zap-dast.yaml}"          # override for a quick/custom plan
 # Required per-target values (no sensible default) — target.env must set these.
 for r in CONTEXT_NAME APP_URL API_URL LOGIN_URL START_URL VERIFY_URL LOGGEDIN_REGEX; do
   [ -n "${!r:-}" ] || { echo "  target.env is missing '$r'"; exit 1; }
